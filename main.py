@@ -2,6 +2,8 @@ import csv
 import datetime
 import os
 import sys
+import tkinter as tk
+
 import cv2
 import numpy as np
 
@@ -162,6 +164,26 @@ def log_recognitions(recognized_identities, last_log_times, min_interval=5.0):
             last_log_times[name] = now
 
 
+def create_control_panel():
+    root = tk.Tk()
+    root.title("OYS Insight Control")
+    root.geometry("220x100")
+    root.resizable(False, False)
+
+    insight_state = tk.BooleanVar(value=False)
+
+    def toggle_insight():
+        insight_state.set(not insight_state.get())
+        state_text = "Insight ON" if insight_state.get() else "Insight OFF"
+        toggle_button.config(text=state_text)
+
+    toggle_button = tk.Button(root, text="Insight OFF", width=20, command=toggle_insight)
+    toggle_button.pack(pady=20)
+
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    return root, insight_state
+
+
 def main():
     detector = FacePoseDetector()
     recognizer = FaceRecognizer()
@@ -179,12 +201,17 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+    control_root, insight_state = create_control_panel()
+
     if recognizer.is_loaded:
         print("Face recognizer loaded. Known identities will be displayed.")
     else:
         print("No trained face recognizer found. Run train_faces.py to enroll and train.")
 
     while True:
+        if not control_root.winfo_exists():
+            break
+
         ret, frame = cap.read()
         if not ret:
             print("Failed to read from webcam.")
@@ -200,8 +227,10 @@ def main():
             face_identities.append(identity)
 
         log_recognitions(face_identities, last_log_times)
-        detector.draw_faces(frame, face_boxes, face_identities)
-        detector.draw_pose(frame, pose_keypoints)
+
+        if insight_state.get():
+            detector.draw_faces(frame, face_boxes, face_identities)
+            detector.draw_pose(frame, pose_keypoints)
 
         face_count = len(face_boxes)
         pose_points = sum(1 for kp in pose_keypoints if kp[0] is not None)
@@ -213,8 +242,15 @@ def main():
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
+        try:
+            control_root.update()
+        except tk.TclError:
+            break
+
     cap.release()
     cv2.destroyAllWindows()
+    if control_root.winfo_exists():
+        control_root.destroy()
 
 
 if __name__ == "__main__":
