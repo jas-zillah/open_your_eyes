@@ -1,0 +1,18 @@
+# Ignore logs containing timestamps and identities
+logs/
+*.log
+*.csv
+
+# Ignore captured face images and datasets
+known_faces/
+data/
+
+# Ignore trained recognizer files that contain label mappings (names)
+models/face_recognizer.yml
+models/face_labels.npy
+
+# OS and editor files
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

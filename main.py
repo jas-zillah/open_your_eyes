@@ -1,11 +1,18 @@
 import csv
 import datetime
 import os
+import platform
 import sys
+import time
 import tkinter as tk
 
 import cv2
 import numpy as np
+
+if platform.system() == "Windows":
+    import winsound
+else:
+    winsound = None
 
 try:
     import tensorflow as tf
@@ -164,24 +171,265 @@ def log_recognitions(recognized_identities, last_log_times, min_interval=5.0):
             last_log_times[name] = now
 
 
-def create_control_panel():
+def beep_signal():
+    if winsound:
+        try:
+            winsound.Beep(1200, 200)
+            return
+        except Exception:
+            try:
+                winsound.MessageBeep(winsound.MB_OK)
+                return
+            except Exception:
+                pass
+    print("\a", end="", flush=True)
+
+
+def create_control_panel(detector, cap, recognizer):
     root = tk.Tk()
     root.title("OYS Insight Control")
-    root.geometry("220x100")
+    root.geometry("280x260")
     root.resizable(False, False)
 
     insight_state = tk.BooleanVar(value=False)
+    calibration_state = {
+        "active": False,
+        "stage": -1,
+        "stage_start": None,
+        "captured_faces": [],
+        "best_face": None,
+        "completed": False,
+        "ready_to_save": False,
+        "instructions": [
+            ("Look straight at the camera", 4),
+            ("Turn your head left", 4),
+            ("Turn your head right", 4),
+            ("Tilt your chin up or down", 4),
+        ],
+    }
 
     def toggle_insight():
         insight_state.set(not insight_state.get())
         state_text = "Insight ON" if insight_state.get() else "Insight OFF"
         toggle_button.config(text=state_text)
 
-    toggle_button = tk.Button(root, text="Insight OFF", width=20, command=toggle_insight)
-    toggle_button.pack(pady=20)
+    def set_status(text):
+        status_label.config(text=text)
+        root.update_idletasks()
+
+    def start_calibration():
+        if calibration_state["active"]:
+            return
+        calibration_state.update({
+            "active": True,
+            "stage": 0,
+            "stage_start": None,
+            "captured_faces": [],
+            "best_face": None,
+            "completed": False,
+            "ready_to_save": False,
+        })
+        if not name_label.winfo_ismapped():
+            name_label.pack(pady=(10, 0))
+            name_entry.pack(pady=(0, 10))
+        if save_button.winfo_ismapped():
+            save_button.pack_forget()
+        save_button.config(state="disabled")
+        set_status("Calibration started. Follow prompts on screen.")
+        calibrate_button.config(state="disabled")
+
+    def get_pose_direction(keypoints, frame_width, frame_height):
+        def kp(name):
+            try:
+                idx = KEYPOINT_NAMES.index(name)
+            except ValueError:
+                return None
+            x, y, score = keypoints[idx]
+            return (x, y, score) if x is not None else None
+
+        nose = kp("nose")
+        left_eye = kp("leftEye")
+        right_eye = kp("rightEye")
+        left_ear = kp("leftEar")
+        right_ear = kp("rightEar")
+        left_shoulder = kp("leftShoulder")
+        right_shoulder = kp("rightShoulder")
+
+        if not nose:
+            return None
+        nose_offset = nose[0] - frame_width / 2
+        center_threshold = frame_width * 0.12
+
+        if left_ear and left_ear[2] > 0.35 and (not right_ear or right_ear[2] < 0.25):
+            return "right"
+        if right_ear and right_ear[2] > 0.35 and (not left_ear or left_ear[2] < 0.25):
+            return "left"
+
+        if left_eye and right_eye:
+            if abs(nose_offset) < center_threshold:
+                if left_shoulder and right_shoulder:
+                    shoulder_center_y = (left_shoulder[1] + right_shoulder[1]) / 2
+                    if nose[1] < shoulder_center_y - 20:
+                        return "tilt_up"
+                    if nose[1] > shoulder_center_y + 20:
+                        return "tilt_down"
+                return "straight"
+            return "left" if nose_offset < 0 else "right"
+
+        if left_ear and right_ear:
+            if abs(nose_offset) < center_threshold:
+                return "straight"
+            return "left" if nose_offset < 0 else "right"
+
+        if left_shoulder and right_shoulder:
+            shoulder_center_y = (left_shoulder[1] + right_shoulder[1]) / 2
+            if nose[1] < shoulder_center_y - 20:
+                return "tilt_up"
+            if nose[1] > shoulder_center_y + 20:
+                return "tilt_down"
+
+        return None
+
+    def update_calibration(frame, face_boxes, pose_keypoints):
+        if not calibration_state["active"] or calibration_state["completed"]:
+            return
+
+        stage = calibration_state["stage"]
+        if stage < 0 or stage >= len(calibration_state["instructions"]):
+            calibration_state["active"] = False
+            calibration_state["completed"] = True
+            set_status("Calibration complete. Enter name and click Save.")
+            calibration_state["ready_to_save"] = any(f is not None for f in calibration_state["captured_faces"])
+            if calibration_state["ready_to_save"]:
+                if not save_button.winfo_ismapped():
+                    save_button.pack(pady=5)
+                save_button.config(state="normal")
+            calibrate_button.config(state="normal")
+            return
+
+        if calibration_state["stage_start"] is None:
+            calibration_state["stage_start"] = time.time()
+            calibration_state["best_face"] = None
+            calibration_state["stable_count"] = 0
+            beep_signal()
+
+        instruction, _ = calibration_state["instructions"][stage]
+        target = ["straight", "left", "right", "tilt"][stage]
+        direction = None
+        if pose_keypoints:
+            direction = get_pose_direction(pose_keypoints, frame.shape[1], frame.shape[0])
+
+        if face_boxes:
+            face_gray = crop_face(frame, face_boxes[0])
+            if face_gray is not None:
+                calibration_state["best_face"] = face_gray
+                cv2.rectangle(frame, (face_boxes[0][0], face_boxes[0][1]), (face_boxes[0][2], face_boxes[0][3]), (0, 255, 0), 2)
+
+        match = False
+        if direction == target:
+            match = True
+        if target == "tilt" and direction in ("tilt_up", "tilt_down"):
+            match = True
+
+        if match:
+            calibration_state["stable_count"] += 1
+        else:
+            calibration_state["stable_count"] = 0
+
+        if direction:
+            direction_text = direction.replace("_", " ").title()
+        else:
+            direction_text = "Looking for a good angle..."
+
+        text_block = [
+            instruction,
+            "Turn your head when the tone sounds",
+            f"Target: {target.replace('_', ' ').title()}",
+            f"Pose: {direction_text}",
+        ]
+
+        box_width = 320
+        box_height = 110
+        x1 = frame.shape[1] - box_width - 10
+        y1 = 10
+        x2 = frame.shape[1] - 10
+        y2 = y1 + box_height
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), cv2.FILLED)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
+
+        for line_index, line_text in enumerate(text_block):
+            y_text = y1 + 25 + (line_index * 22)
+            cv2.putText(frame, line_text, (x1 + 8, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        if calibration_state["stable_count"] >= 5 and calibration_state["best_face"] is not None:
+            calibration_state["captured_faces"].append(calibration_state["best_face"])
+            calibration_state["stage"] += 1
+            calibration_state["stage_start"] = None
+            if calibration_state["stage"] >= len(calibration_state["instructions"]):
+                calibration_state["active"] = False
+                calibration_state["completed"] = True
+                calibration_state["ready_to_save"] = any(f is not None for f in calibration_state["captured_faces"])
+                if calibration_state["ready_to_save"]:
+                    if not save_button.winfo_ismapped():
+                        save_button.pack(pady=5)
+                    save_button.config(state="normal")
+                    set_status("Calibration complete. Enter name and click Save.")
+                else:
+                    set_status("Calibration complete but no faces captured. Retry.")
+                calibrate_button.config(state="normal")
+            else:
+                beep_signal()
+                set_status(f"Next stage: {calibration_state['instructions'][calibration_state['stage']][0]}")
+
+    def save_calibration():
+        name = name_entry.get().strip()
+        if not name:
+            set_status("Enter a face name before saving.")
+            return
+        valid_faces = [face for face in calibration_state["captured_faces"] if face is not None]
+        if len(valid_faces) == 0:
+            set_status("No valid calibrated faces available. Calibrate again.")
+            return
+
+        try:
+            saved_count = recognizer.save_calibrated_faces(name, valid_faces, replace=True)
+            recognizer.train()
+            set_status(f"Saved {saved_count} images and trained {name}.")
+            calibration_state.update({
+                "active": False,
+                "stage": -1,
+                "stage_start": None,
+                "captured_faces": [],
+                "best_face": None,
+                "completed": False,
+                "ready_to_save": False,
+            })
+            save_button.config(state="disabled")
+            name_entry.delete(0, tk.END)
+            name_label.pack_forget()
+            name_entry.pack_forget()
+        except Exception as error:
+            set_status(f"Save failed: {error}")
+
+    toggle_button = tk.Button(root, text="Insight OFF", width=24, command=toggle_insight)
+    toggle_button.pack(pady=(15, 5))
+
+    calibrate_button = tk.Button(root, text="Calibrate Face", width=24, command=start_calibration)
+    calibrate_button.pack(pady=5)
+
+    name_label = tk.Label(root, text="Face name:")
+    name_entry = tk.Entry(root, width=32)
+
+    save_button = tk.Button(root, text="Save Calibration", width=24, command=save_calibration, state="disabled")
+
+    stop_button = tk.Button(root, text="Stop App", width=24, command=root.destroy)
+    stop_button.pack(pady=(5, 10))
+
+    status_label = tk.Label(root, text="Ready", anchor="w", justify="left")
+    status_label.pack(fill="x", padx=10)
 
     root.protocol("WM_DELETE_WINDOW", root.destroy)
-    return root, insight_state
+    return root, insight_state, calibration_state, save_button, name_label, name_entry, update_calibration
 
 
 def main():
@@ -201,7 +449,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    control_root, insight_state = create_control_panel()
+    control_root, insight_state, calibration_state, save_button, name_label, name_entry, update_calibration = create_control_panel(detector, cap, recognizer)
 
     if recognizer.is_loaded:
         print("Face recognizer loaded. Known identities will be displayed.")
@@ -219,6 +467,9 @@ def main():
 
         face_boxes = detector.detect_faces(frame)
         pose_keypoints = detector.detect_pose(frame)
+
+        if calibration_state["active"]:
+            update_calibration(frame, face_boxes, pose_keypoints)
 
         face_identities = []
         for box in face_boxes:
