@@ -135,6 +135,27 @@ class FaceRecognizer:
         self.labels = label_map
         self._loaded = True
 
+    def save_calibrated_faces(self, name, face_grays, replace=True):
+        ensure_directories()
+        person_dir = os.path.join(KNOWN_FACES_DIR, name)
+        if replace and os.path.exists(person_dir):
+            for image_file in glob.glob(os.path.join(person_dir, "*.png")):
+                os.remove(image_file)
+        os.makedirs(person_dir, exist_ok=True)
+
+        saved = 0
+        for idx, face_gray in enumerate(face_grays, start=1):
+            if face_gray is None:
+                continue
+            filename = os.path.join(person_dir, f"calib_{idx:02d}.png")
+            cv2.imwrite(filename, face_gray)
+            saved += 1
+
+        if saved == 0:
+            raise RuntimeError("No valid calibrated face images were saved.")
+
+        return saved
+
 
 def capture_face_samples(name, sample_count=20, skip_frames=5):
     ensure_directories()
