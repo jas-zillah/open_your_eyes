@@ -350,9 +350,9 @@ def create_control_panel(detector, cap, recognizer):
 
         box_width = 320
         box_height = 110
-        x1 = frame.shape[1] - box_width - 10
+        x1 = 10
         y1 = 10
-        x2 = frame.shape[1] - 10
+        x2 = x1 + box_width
         y2 = y1 + box_height
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), cv2.FILLED)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
@@ -467,6 +467,18 @@ def main():
 
         face_boxes = detector.detect_faces(frame)
         pose_keypoints = detector.detect_pose(frame)
+
+        # Flip frame for mirror view
+        frame = cv2.flip(frame, 1)
+        frame_width = frame.shape[1]
+
+        # Adjust face boxes for flipped frame
+        face_boxes = [(frame_width - x2, y1, frame_width - x1, y2, conf)
+                      for x1, y1, x2, y2, conf in face_boxes]
+
+        # Adjust keypoints for flipped frame
+        pose_keypoints = [(frame_width - x if x is not None else None, y, score)
+                          for x, y, score in pose_keypoints]
 
         if calibration_state["active"]:
             update_calibration(frame, face_boxes, pose_keypoints)
