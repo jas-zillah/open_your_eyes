@@ -12,6 +12,9 @@ LABELS_PATH = os.path.join(MODEL_DIR, "face_labels.npy")
 FACE_PROTO = os.path.join(MODEL_DIR, "face_detector.prototxt")
 FACE_MODEL = os.path.join(MODEL_DIR, "face_detector.caffemodel")
 
+# simple module-level cache for the detector to avoid repeated loads
+_CACHED_DETECTOR = None
+
 
 def ensure_directories():
     os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
@@ -19,11 +22,26 @@ def ensure_directories():
 
 
 def load_face_detector():
+    global _CACHED_DETECTOR
+    if _CACHED_DETECTOR is not None:
+        return _CACHED_DETECTOR
     if not os.path.exists(FACE_PROTO) or not os.path.exists(FACE_MODEL):
         raise FileNotFoundError(
             "Face detector model files not found. Run download_models.py to download the required models."
         )
-    return cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
+    net = cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
+    # attempt to use OpenCL if available, otherwise keep CPU defaults
+    try:
+        if hasattr(cv2.dnn, "DNN_TARGET_OPENCL") and hasattr(cv2.dnn, "DNN_BACKEND_DEFAULT"):
+            try:
+                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+                net.setPreferableTarget(cv2.dnn.DNN_TARGET_OPENCL)
+            except cv2.error:
+                pass
+    except Exception:
+        pass
+    _CACHED_DETECTOR = net
+    return _CACHED_DETECTOR
 
 
 def detect_faces(frame, confidence_threshold=0.6):

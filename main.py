@@ -44,6 +44,11 @@ KEYPOINT_NAMES = [
 class FacePoseDetector:
     def __init__(self):
         self.face_net = self._load_face_detector()
+        # trackers for fast per-frame face localization between expensive DNN runs
+        self.trackers = []
+        self.tracker_boxes = []
+        self.detect_interval = 5  # run DNN detector every N frames
+        self._frame_count = 0
         self.pose_interpreter, self.input_details, self.output_details = self._load_posenet()
 
     def _load_face_detector(self):
@@ -52,6 +57,38 @@ class FacePoseDetector:
                 "Face detection model files not found. Run download_models.py to download the models."
             )
         net = cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
+        # Prefer hardware acceleration when available; check support first
+        try:
+            def _supports_dnn_cuda():
+                try:
+                    info = cv2.getBuildInformation()
+                    if "CUDA" in info:
+                        try:
+                            return cv2.cuda.getCudaEnabledDeviceCount() > 0
+                        except Exception:
+                            return True
+                    return False
+                except Exception:
+                    return False
+
+            if _supports_dnn_cuda() and hasattr(cv2.dnn, "DNN_BACKEND_CUDA") and hasattr(cv2.dnn, "DNN_TARGET_CUDA"):
+                try:
+                    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                except cv2.error:
+                    # fallback to CPU if the build doesn't actually support DNN CUDA
+                    pass
+            else:
+                # try OpenCL if available, otherwise use CPU
+                try:
+                    if hasattr(cv2.dnn, "DNN_TARGET_OPENCL"):
+                        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+                        net.setPreferableTarget(cv2.dnn.DNN_TARGET_OPENCL)
+                except cv2.error:
+                    pass
+        except Exception:
+            # if anything unexpected happens, silently continue using defaults
+            pass
         return net
 
     def _load_posenet(self):
@@ -66,11 +103,40 @@ class FacePoseDetector:
         return interpreter, input_details, output_details
 
     def detect_faces(self, frame, confidence_threshold=0.6):
+        # Use lightweight tracking between expensive DNN runs to improve speed.
+        self._frame_count += 1
         height, width = frame.shape[:2]
+
+        # Update trackers if available and we are not running the DNN this frame
+        if self.trackers and (self._frame_count % self.detect_interval) != 0:
+            new_boxes = []
+            kept_trackers = []
+            kept_boxes = []
+            for tr, last_conf in zip(self.trackers, self.tracker_boxes):
+                try:
+                    ok, box = tr.update(frame)
+                except Exception:
+                    ok = False
+                if ok:
+                    x, y, w, h = [int(v) for v in box]
+                    x1 = max(0, x)
+                    y1 = max(0, y)
+                    x2 = min(width, x + w)
+                    y2 = min(height, y + h)
+                    new_boxes.append((x1, y1, x2, y2, last_conf))
+                    kept_trackers.append(tr)
+                    kept_boxes.append(last_conf)
+            self.trackers = kept_trackers
+            self.tracker_boxes = kept_boxes
+            return new_boxes
+
+        # Otherwise run the DNN detector and (re)initialize trackers
         blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
         self.face_net.setInput(blob)
         detections = self.face_net.forward()
         boxes = []
+        new_trackers = []
+        new_confidences = []
         for i in range(detections.shape[2]):
             confidence = float(detections[0, 0, i, 2])
             if confidence < confidence_threshold:
@@ -80,12 +146,43 @@ class FacePoseDetector:
             x2 = int(detections[0, 0, i, 5] * width)
             y2 = int(detections[0, 0, i, 6] * height)
             boxes.append((x1, y1, x2, y2, confidence))
+            # initialize tracker for this face
+            w = max(4, x2 - x1)
+            h = max(4, y2 - y1)
+            try:
+                tracker = cv2.TrackerKCF_create()
+            except Exception:
+                try:
+                    tracker = cv2.legacy.TrackerKCF_create()
+                except Exception:
+                    tracker = None
+            if tracker is not None:
+                try:
+                    tracker.init(frame, (x1, y1, w, h))
+                    new_trackers.append(tracker)
+                    new_confidences.append(confidence)
+                except Exception:
+                    pass
+
+        self.trackers = new_trackers
+        self.tracker_boxes = new_confidences
         return boxes
 
-    def detect_pose(self, frame, threshold=0.25):
+    def detect_pose(self, frame, threshold=0.25, face_boxes=None, use_full_frame=False):
+        # For better tilt detection, use full-frame when face_boxes exist (shoulders need context)
+        # but still optimize by cropping when only tracking heads
         input_shape = self.input_details[0]["shape"]
         input_height, input_width = input_shape[1], input_shape[2]
+
+        # Always use full frame to get shoulders for tilt detection
+        use_full_frame = True
+        
         image = cv2.resize(frame, (input_width, input_height))
+        offset_x = 0
+        offset_y = 0
+        crop_w = frame.shape[1]
+        crop_h = frame.shape[0]
+
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         input_data = np.expand_dims(image_rgb.astype(np.float32), axis=0)
         input_data = (input_data - 127.5) / 127.5
@@ -94,6 +191,7 @@ class FacePoseDetector:
         heatmaps = self.pose_interpreter.get_tensor(self.output_details[0]["index"])
         offsets = self.pose_interpreter.get_tensor(self.output_details[1]["index"])
         keypoints = self._decode_pose(heatmaps, offsets, frame.shape[:2], threshold)
+
         return keypoints
 
     @staticmethod
@@ -260,19 +358,25 @@ def create_control_panel(detector, cap, recognizer):
         nose_offset = nose[0] - frame_width / 2
         center_threshold = frame_width * 0.12
 
-        if left_ear and left_ear[2] > 0.35 and (not right_ear or right_ear[2] < 0.25):
+        # Detect left/right by ears with relaxed confidence
+        if left_ear and left_ear[2] > 0.25 and (not right_ear or right_ear[2] < 0.20):
             return "right"
-        if right_ear and right_ear[2] > 0.35 and (not left_ear or left_ear[2] < 0.25):
+        if right_ear and right_ear[2] > 0.25 and (not left_ear or left_ear[2] < 0.20):
             return "left"
 
+        # Detect tilt with improved shoulder-based logic
+        if left_shoulder and right_shoulder and left_shoulder[2] > 0.15 and right_shoulder[2] > 0.15:
+            shoulder_center_y = (left_shoulder[1] + right_shoulder[1]) / 2
+            nose_y_diff = nose[1] - shoulder_center_y
+            # Increased threshold from 20 to 50 pixels for better tilt detection
+            if nose_y_diff < -50:
+                return "tilt_up"
+            if nose_y_diff > 50:
+                return "tilt_down"
+
+        # Fallback: detect straight, left, right by eye/nose position
         if left_eye and right_eye:
             if abs(nose_offset) < center_threshold:
-                if left_shoulder and right_shoulder:
-                    shoulder_center_y = (left_shoulder[1] + right_shoulder[1]) / 2
-                    if nose[1] < shoulder_center_y - 20:
-                        return "tilt_up"
-                    if nose[1] > shoulder_center_y + 20:
-                        return "tilt_down"
                 return "straight"
             return "left" if nose_offset < 0 else "right"
 
@@ -280,13 +384,6 @@ def create_control_panel(detector, cap, recognizer):
             if abs(nose_offset) < center_threshold:
                 return "straight"
             return "left" if nose_offset < 0 else "right"
-
-        if left_shoulder and right_shoulder:
-            shoulder_center_y = (left_shoulder[1] + right_shoulder[1]) / 2
-            if nose[1] < shoulder_center_y - 20:
-                return "tilt_up"
-            if nose[1] > shoulder_center_y + 20:
-                return "tilt_down"
 
         return None
 
@@ -466,7 +563,7 @@ def main():
             break
 
         face_boxes = detector.detect_faces(frame)
-        pose_keypoints = detector.detect_pose(frame)
+        pose_keypoints = detector.detect_pose(frame, face_boxes=face_boxes)
 
         # Flip frame for mirror view
         frame = cv2.flip(frame, 1)
