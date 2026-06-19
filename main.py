@@ -245,6 +245,7 @@ class FacePoseDetector:
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 LOG_FILE = os.path.join(LOG_DIR, "recognition_log.csv")
+ATTENDANCE_FILE = os.path.join(LOG_DIR, "attendance_log.csv")
 
 
 def ensure_log_file():
@@ -253,6 +254,66 @@ def ensure_log_file():
         with open(LOG_FILE, "w", newline="", encoding="utf-8") as fp:
             writer = csv.writer(fp)
             writer.writerow(["timestamp", "name", "confidence"])
+
+
+def ensure_attendance_file():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    if not os.path.exists(ATTENDANCE_FILE):
+        with open(ATTENDANCE_FILE, "w", newline="", encoding="utf-8") as fp:
+            writer = csv.writer(fp)
+            writer.writerow(["date", "name", "check_in", "check_out"])
+
+
+def load_attendance_records():
+    records = {}
+    if not os.path.exists(ATTENDANCE_FILE):
+        return records
+    with open(ATTENDANCE_FILE, "r", newline="", encoding="utf-8") as fp:
+        reader = csv.DictReader(fp)
+        for row in reader:
+            date = row.get("date")
+            name = row.get("name")
+            if not date or not name:
+                continue
+            records[(date, name)] = {
+                "check_in": row.get("check_in", ""),
+                "check_out": row.get("check_out", ""),
+            }
+    return records
+
+
+def save_attendance_records(records):
+    with open(ATTENDANCE_FILE, "w", newline="", encoding="utf-8") as fp:
+        writer = csv.writer(fp)
+        writer.writerow(["date", "name", "check_in", "check_out"])
+        for (date, name), data in sorted(records.items()):
+            writer.writerow([date, name, data.get("check_in", ""), data.get("check_out", "")])
+
+
+def format_attendance_status(attendance_records):
+    today = datetime.date.today().isoformat()
+    rows = []
+    for (record_date, name), data in sorted(attendance_records.items()):
+        if record_date != today:
+            continue
+        check_in = data.get("check_in", "")
+        check_out = data.get("check_out", "")
+        if check_in and check_out:
+            status = f"IN {check_in.split('T')[1]} / OUT {check_out.split('T')[1]}"
+        elif check_in:
+            status = f"IN {check_in.split('T')[1]}"
+        elif check_out:
+            status = f"OUT {check_out.split('T')[1]}"
+        else:
+            status = "No record"
+        rows.append(f"{name}: {status}")
+    if not rows:
+        return "Attendance today:\nNone recorded yet"
+    display = [f"Attendance today: {len(rows)} person(s)"]
+    display.extend(rows[:6])
+    if len(rows) > 6:
+        display.append(f"...and {len(rows) - 6} more")
+    return "\n".join(display)
 
 
 def log_recognitions(recognized_identities, last_log_times, min_interval=5.0):
@@ -269,6 +330,43 @@ def log_recognitions(recognized_identities, last_log_times, min_interval=5.0):
             last_log_times[name] = now
 
 
+def should_record_attendance(now, record):
+    if now.time() < datetime.time(8, 0):
+        return None
+    if not record["check_in"]:
+        return "check_in"
+    if not record["check_out"] and now.time() >= datetime.time(16, 45):
+        return "check_out"
+    return None
+
+
+def log_attendance(recognized_identities, attendance_records, attendance_last_times, min_interval=300.0):
+    now = datetime.datetime.now()
+    today = now.date().isoformat()
+    updated = False
+    for name, confidence in recognized_identities:
+        if name == "Unknown" or confidence is None:
+            continue
+        last_time = attendance_last_times.get(name)
+        if last_time is not None and (now - last_time).total_seconds() < min_interval:
+            continue
+        key = (today, name)
+        record = attendance_records.get(key, {"check_in": "", "check_out": ""})
+        action = should_record_attendance(now, record)
+        if action == "check_in":
+            record["check_in"] = now.isoformat(timespec="seconds")
+            attendance_records[key] = record
+            updated = True
+            attendance_last_times[name] = now
+        elif action == "check_out":
+            record["check_out"] = now.isoformat(timespec="seconds")
+            attendance_records[key] = record
+            updated = True
+            attendance_last_times[name] = now
+    if updated:
+        save_attendance_records(attendance_records)
+
+
 def beep_signal():
     if winsound:
         try:
@@ -283,10 +381,10 @@ def beep_signal():
     print("\a", end="", flush=True)
 
 
-def create_control_panel(detector, cap, recognizer):
+def create_control_panel(detector, cap, recognizer, attendance_records):
     root = tk.Tk()
     root.title("OYS Insight Control")
-    root.geometry("280x260")
+    root.geometry("320x320")
     root.resizable(False, False)
 
     insight_state = tk.BooleanVar(value=False)
@@ -525,15 +623,27 @@ def create_control_panel(detector, cap, recognizer):
     status_label = tk.Label(root, text="Ready", anchor="w", justify="left")
     status_label.pack(fill="x", padx=10)
 
+    attendance_status_label = tk.Label(root, text=format_attendance_status(attendance_records), anchor="w", justify="left")
+    attendance_status_label.pack(fill="x", padx=10, pady=(5, 10))
+
+    def refresh_attendance_status():
+        attendance_status_label.config(text=format_attendance_status(attendance_records))
+        root.after(1000, refresh_attendance_status)
+
+    refresh_attendance_status()
+
     root.protocol("WM_DELETE_WINDOW", root.destroy)
-    return root, insight_state, calibration_state, save_button, name_label, name_entry, update_calibration
+    return root, insight_state, calibration_state, save_button, name_label, name_entry, update_calibration, attendance_status_label
 
 
 def main():
     detector = FacePoseDetector()
     recognizer = FaceRecognizer()
     ensure_log_file()
+    ensure_attendance_file()
+    attendance_records = load_attendance_records()
     last_log_times = {}
+    attendance_last_times = {}
     camera_index = 0
     cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not cap.isOpened():
@@ -546,7 +656,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    control_root, insight_state, calibration_state, save_button, name_label, name_entry, update_calibration = create_control_panel(detector, cap, recognizer)
+    control_root, insight_state, calibration_state, save_button, name_label, name_entry, update_calibration, attendance_status_label = create_control_panel(detector, cap, recognizer, attendance_records)
 
     if recognizer.is_loaded:
         print("Face recognizer loaded. Known identities will be displayed.")
@@ -587,6 +697,7 @@ def main():
             face_identities.append(identity)
 
         log_recognitions(face_identities, last_log_times)
+        log_attendance(face_identities, attendance_records, attendance_last_times)
 
         if insight_state.get():
             detector.draw_faces(frame, face_boxes, face_identities)
